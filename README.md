@@ -1,15 +1,6 @@
 Tvheadend
 ========================================
-(c) 2006 - 2017 Tvheadend Foundation CIC
-
-Status
-------
-
-[![Build Status](https://travis-ci.org/tvheadend/tvheadend.svg?branch=master)](https://travis-ci.org/tvheadend/tvheadend)
-
-[![Download](https://api.bintray.com/packages/tvheadend/deb/tvheadend/images/download.svg)](https://bintray.com/tvheadend/deb/tvheadend/)
-
-[![Coverity Scan](https://scan.coverity.com/projects/2114/badge.svg)](https://scan.coverity.com/projects/2114)
+(c) 2006 - 2020 Tvheadend Foundation CIC
 
 What it is
 ----------
