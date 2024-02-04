@@ -67,6 +67,7 @@ static struct caid_tab caidnametab[] = {
   { "DGCrypt",          0x4abf, 0xffff },
   { "XCrypt",           0x4ad0, 0xfffe },
   { "StreamGuard",      0x4ad2, 0xffff },
+  { "Widevine",         0x4ad4, 0xfffe },
   { "DRECrypt",         0x4ae0, 0xffff },
   { "DRECrypt2",        0x4ae1, 0xffff },
   { "Bulcrypt",         0x4aee, 0xffff },
