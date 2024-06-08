@@ -3,7 +3,7 @@
 
 # systemd
 # See tvheadend --help for more - default "-u hts -g video"
-OPTIONS="-u hts -g video"
+OPTIONS="-u hts -g video -6"
 
 # sysvinit
 # 
