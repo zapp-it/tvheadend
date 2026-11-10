@@ -172,6 +172,7 @@ struct iptv_mux
   uint32_t              mm_iptv_satip_dvbs_freq;
 
   uint32_t              mm_iptv_rtp_seq;
+  uint32_t              mm_iptv_rtp_ssrc;
 
   sbuf_t                mm_iptv_buffer;
   sbuf_t                im_temp_buffer;
