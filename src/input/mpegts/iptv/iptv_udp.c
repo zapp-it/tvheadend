@@ -61,6 +61,7 @@ iptv_udp_start
   }
 
   im->mm_iptv_rtp_seq = -1;
+  im->mm_iptv_rtp_ssrc = 0;
 
   iptv_input_mux_started(mi, im, 1);
   return 0;
@@ -181,8 +182,18 @@ iptv_rtp_read(iptv_mux_t *im, void (*pkt_cb)(iptv_mux_t *im, uint8_t *pkt, int l
     len -= hlen;
 
     nseq = (rtp[2] << 8) | rtp[3];
+    ssrc = (rtp[8] << 24) | (rtp[9] << 16) | (rtp[10] << 8) | rtp[11];
+    if (seq == -1 || im->mm_iptv_rtp_ssrc == 0) {
+      im->mm_iptv_rtp_ssrc = ssrc;
+    } else if (ssrc != im->mm_iptv_rtp_ssrc) {
+      tvhtrace(LS_IPTV, "ignoring RTP packet from unselected SSRC 0x%x for %s "
+          "(selected SSRC: 0x%x)", ssrc, im->mm_nicename, im->mm_iptv_rtp_ssrc);
+      continue;
+    }
+
     if (seq == -1 || nseq == 0)
       seq = nseq;
+
     /* Some sources will send the retransmission packets as part of the regular
      * stream, we can only detect them by checking for the expected seqn. */
     if (im->im_is_ce_detected && !is_ret_buffer && nseq == im->im_rtcp_info.last_received_sequence) {
@@ -195,7 +206,6 @@ iptv_rtp_read(iptv_mux_t *im, void (*pkt_cb)(iptv_mux_t *im, uint8_t *pkt, int l
       if(seq != nseq && ((seq + 1) & 0xffff) != nseq) {
         unc += (len / 188)
             * (uint32_t) ((uint16_t) nseq - (uint16_t) (seq + 1));
-        ssrc = (rtp[8] << 24) | (rtp[9] << 16) | (rtp[10] << 8) | rtp[11];
       /* Use uncorrectable value to notify RTP delivery issues */
         tvhwarn(LS_IPTV, "RTP discontinuity for %s SSRC: 0x%x (%i != %i)", im->mm_nicename,
             ssrc, seq + 1, nseq);
@@ -206,10 +216,8 @@ iptv_rtp_read(iptv_mux_t *im, void (*pkt_cb)(iptv_mux_t *im, uint8_t *pkt, int l
       }
       seq = nseq;
     }
-
     if (im->im_is_ce_detected) {
       /* Move data to RET buffer */
-      ssrc = (rtp[8] << 24) | (rtp[9] << 16) | (rtp[10] << 8) | rtp[11];
       if (is_ret_buffer) {
         oseq = (rtp[12] << 8) | rtp[13];
         tvhtrace(LS_IPTV, "RTP RET received SEQ %i OSN %i for SSRC: 0x%x", nseq, oseq, ssrc);

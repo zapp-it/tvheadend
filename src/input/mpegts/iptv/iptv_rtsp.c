@@ -329,6 +329,7 @@ iptv_rtsp_start
   im->im_rtcp_info.connection_fd = rtcp->fd;
   im->im_rtcp_info.connection = rtcp;
   im->mm_iptv_rtp_seq = -1;
+  im->mm_iptv_rtp_ssrc = 0;
   return 0;
 }
 
