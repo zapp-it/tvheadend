@@ -64,6 +64,7 @@ Desktop.ini
 #macOS files
 .DS_Store
 _codeql_detected_source_root
+_codeql_detected_source_root
 
 # Claude Code local workspace (lock files, settings, etc.)
 .claude/
