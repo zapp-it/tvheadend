@@ -174,15 +174,21 @@ psi_desc_ca
  */
 static int
 psi_desc_teletext(elementary_set_t *set, const uint8_t *ptr, int size,
-                  int parent_pid, int *position)
+                  int parent_pid, int *position, int *initial_page)
 {
   int r = 0;
+  int first;
   const char *lang;
   elementary_stream_t *st;
 
   while(size >= 5) {
     int page = (ptr[3] & 0x7 ?: 8) * 100 + (ptr[4] >> 4) * 10 + (ptr[4] & 0xf);
     int type = ptr[3] >> 3;
+
+    /* 1 = initial page (the first one, if one per language); the page
+     * number 0xff is reserved (no page) */
+    if(type == 1 && page > 0 && ptr[4] != 0xff && *initial_page == 0)
+      *initial_page = page;
 
     if(page > 0 && (type == 2 || type == 5)) {
       // 2 = subtitle page, 5 = subtitle page [hearing impaired]
@@ -192,6 +198,8 @@ psi_desc_teletext(elementary_set_t *set, const uint8_t *ptr, int size,
       int pid = DVB_TELETEXT_BASE + page;
     
       st = elementary_stream_find_parent(set, pid, parent_pid);
+      /* first entry of this page in this PMT (es_delete_me: not seen yet) */
+      first = st == NULL || st->es_type != SCT_TEXTSUB || st->es_delete_me;
       if (st == NULL || st->es_type != SCT_TEXTSUB) {
         r |= PMT_UPDATE_NEW_STREAM;
         st = elementary_stream_create_parent(set, pid, parent_pid, SCT_TEXTSUB);
@@ -201,6 +209,14 @@ psi_desc_teletext(elementary_set_t *set, const uint8_t *ptr, int size,
       if(memcmp(st->es_lang,lang,3)) {
         r |= PMT_UPDATE_LANGUAGE;
         memcpy(st->es_lang, lang, 4);
+      }
+
+      /* a page listed twice (as 2 and as 5) keeps the type of its first
+       * entry - taking each in turn changed it on every PMT and restarted
+       * the service */
+      if(first && st->es_subtitle_type != type) {
+        r |= PMT_UPDATE_SUBTITLE_TYPE;
+        st->es_subtitle_type = type;
       }
 
       // Check es_delete_me so we only compute position once per PMT update
@@ -218,14 +234,85 @@ psi_desc_teletext(elementary_set_t *set, const uint8_t *ptr, int size,
 }
 
 /**
+ * Audio type from the component_type of the AC-3 and Enhanced AC-3
+ * descriptors (EN 300 468 annex D): service_type 2 = visually impaired
+ * (audio description), 3 = hearing impaired; full_service_flag
+ */
+static void
+psi_desc_ac3_component(const uint8_t *ptr, int size, int *audio_type,
+                       int *receiver_mix)
+{
+  if (size < 2 || !(ptr[0] & 0x80)) /* component_type_flag */
+    return;
+  /* full_service_flag 0: to be combined with another (main) service; a
+   * complete main service (service_type 0) is always complete */
+  if ((ptr[1] >> 3) & 0x07)
+    *receiver_mix = !(ptr[1] & 0x40);
+  switch ((ptr[1] >> 3) & 0x07) {   /* service_type */
+  case 0x02:
+    *audio_type = 3;
+    break;
+  case 0x03:
+    *audio_type = 2;
+    break;
+  default:
+    break;
+  }
+}
+
+/**
+ * Audio type from the AAC_type of the AAC descriptor (the component_type
+ * values of stream_content 0x6, EN 300 468 table 26)
+ */
+static void
+psi_desc_aac_type(const uint8_t *ptr, int size, int *audio_type,
+                  int *receiver_mix)
+{
+  if (size < 3 || !(ptr[1] & 0x80)) /* AAC_type_flag */
+    return;
+  switch (ptr[2]) {
+  case 0x42: /* HE-AAC receiver-mixed supplementary audio */
+  case 0x46: /* HE-AAC v2 receiver-mixed supplementary audio */
+  case 0x47: /* HE-AAC receiver mix audio description */
+  case 0x49: /* HE-AAC v2 receiver mix audio description */
+    *receiver_mix = 1;
+    break;
+  default:
+    *receiver_mix = 0;
+    break;
+  }
+  switch (ptr[2]) {
+  case 0x40: /* HE-AAC audio description for the visually impaired */
+  case 0x44: /* HE-AAC v2 audio description ... */
+  case 0x47: /* HE-AAC receiver mix audio description ... */
+  case 0x48: /* HE-AAC broadcaster mix audio description ... */
+  case 0x49: /* HE-AAC v2 receiver mix audio description ... */
+  case 0x4a: /* HE-AAC v2 broadcaster mix audio description ... */
+    *audio_type = 3;
+    break;
+  case 0x41: /* HE-AAC audio for the hard of hearing */
+  case 0x45: /* HE-AAC v2 audio for the hard of hearing */
+    *audio_type = 2;
+    break;
+  default:
+    break;
+  }
+}
+
+/**
  * Parser for supplementary audio descriptor (EN 300 468 6.4.11)
  */
 static void
 psi_desc_supplementary_audio(const uint8_t *ptr, int size,
-                             int *audio_type, const char **lang)
+                             int *audio_type, const char **lang,
+                             int *receiver_mix)
 {
   if (size < 2 || ptr[0] != 0x06)
     return;
+
+  /* mix_type 0: supplementary stream, mixed with the main audio by the
+   * receiver; 1: complete and independent */
+  *receiver_mix = !(ptr[1] & 0x80);
 
   switch ((ptr[1] >> 2) & 0x1f) { /* editorial_classification */
   case 0x01: /* audio description for the visually impaired */
@@ -272,9 +359,12 @@ dvb_psi_parse_pmt
   uint32_t update = 0;
   int composition_id;
   int ancillary_id;
+  int component_tag;
+  int subtitling_type;
   int version;
   int position;
   int tt_position;
+  int tt_initial_page;
   int video_stream;
   int rds_uecp;
   int ac4;
@@ -283,6 +373,10 @@ dvb_psi_parse_pmt
   const char *supp_lang;
   uint8_t audio_type, audio_version;
   int supp_audio_type;
+  int codec_audio_type;
+  int supp_receiver_mix;
+  int codec_receiver_mix;
+  int receiver_mix;
   mpegts_mux_t *mux = mt->mt_mux;
   caid_t *c, *cn;
 
@@ -342,13 +436,19 @@ dvb_psi_parse_pmt
     hts_stream_type = SCT_UNKNOWN;
     composition_id = -1;
     ancillary_id = -1;
+    component_tag = -1;
+    subtitling_type = -1;
     rds_uecp = 0;
     ac4 = 0;
     tt_position = 1000;
+    tt_initial_page = 0;
     lang = NULL;
     supp_lang = NULL;
     audio_type = 0;
     supp_audio_type = -1;
+    codec_audio_type = -1;
+    supp_receiver_mix = -1;
+    codec_receiver_mix = -1;
     audio_version = 0;
     video_stream = 0;
 
@@ -426,6 +526,10 @@ dvb_psi_parse_pmt
         video_stream = dlen > 0 && SCT_ISVIDEO(hts_stream_type);
         break;
 
+      case DVB_DESC_STREAM_ID:
+        component_tag = dlen >= 1 ? ptr[0] : -1;
+        break;
+
       case DVB_DESC_REGISTRATION:
         if(mux->mm_pmt_ac3 != MM_AC3_PMT_N05 && dlen == 4 &&
            ptr[0] == 'A' && ptr[1] == 'C' && ptr[2] == '-' &&  ptr[3] == '3')
@@ -442,13 +546,15 @@ dvb_psi_parse_pmt
       case DVB_DESC_TELETEXT:
         if(estype == 0x06) {
           hts_stream_type = SCT_TELETEXT;
-          update |= psi_desc_teletext(set, ptr, dlen, pid, &tt_position);
+          update |= psi_desc_teletext(set, ptr, dlen, pid, &tt_position,
+                                      &tt_initial_page);
         }
         break;
 
       case DVB_DESC_AC3:
         if(estype == 0x06 || estype == 0x81)
           hts_stream_type = SCT_AC3;
+        psi_desc_ac3_component(ptr, dlen, &codec_audio_type, &codec_receiver_mix);
         break;
 
       case DVB_DESC_AAC:
@@ -456,6 +562,7 @@ dvb_psi_parse_pmt
           hts_stream_type = SCT_MP4A;
         else if(estype == 0x11)
           hts_stream_type = SCT_AAC;
+        psi_desc_aac_type(ptr, dlen, &codec_audio_type, &codec_receiver_mix);
         break;
 
       case DVB_DESC_SUBTITLE:
@@ -463,6 +570,7 @@ dvb_psi_parse_pmt
           break;
 
         lang = lang_code_get2((const char*)ptr, 3);
+        subtitling_type = ptr[3];
         composition_id = extract_2byte(ptr + 4);
         ancillary_id   = extract_2byte(ptr + 6);
         hts_stream_type = SCT_DVBSUB;
@@ -471,6 +579,7 @@ dvb_psi_parse_pmt
       case DVB_DESC_EAC3:
         if(estype == 0x06 || estype == 0x81)
           hts_stream_type = SCT_EAC3;
+        psi_desc_ac3_component(ptr, dlen, &codec_audio_type, &codec_receiver_mix);
         break;
 
       case DVB_DESC_EXTENSION:
@@ -483,7 +592,8 @@ dvb_psi_parse_pmt
         if((estype == 0x06 || estype == 0x81) && ac4)
           hts_stream_type = SCT_AC4;
 
-        psi_desc_supplementary_audio(ptr, dlen, &supp_audio_type, &supp_lang);
+        psi_desc_supplementary_audio(ptr, dlen, &supp_audio_type, &supp_lang,
+                                     &supp_receiver_mix);
         break;
 
       case DVB_DESC_ANCILLARY_DATA:
@@ -505,8 +615,17 @@ dvb_psi_parse_pmt
 
     if (supp_lang)
       lang = supp_lang;
+    /* the codec descriptors (AC-3, E-AC-3, AAC) when the ISO 639
+     * descriptor says nothing; the supplementary audio descriptor wins */
+    if (codec_audio_type >= 0 && audio_type == 0)
+      audio_type = codec_audio_type;
     if (supp_audio_type >= 0)
       audio_type = supp_audio_type;
+    receiver_mix = 0;
+    if (supp_receiver_mix >= 0)
+      receiver_mix = supp_receiver_mix;
+    else if (codec_receiver_mix >= 0)
+      receiver_mix = codec_receiver_mix;
 
     if (hts_stream_type != SCT_UNKNOWN) {
 
@@ -549,6 +668,11 @@ dvb_psi_parse_pmt
         st->es_audio_version = audio_version;
       }
 
+      if(st->es_receiver_mix != receiver_mix) {
+        update |= PMT_UPDATE_AUDIO_TYPE;
+        st->es_receiver_mix = receiver_mix;
+      }
+
       /* FIXME: it might make sense that PMT info has greater priority */
       /*        but we use this field only for MPEG1/2/3 audio which */
       /*        is detected in the parser code */
@@ -567,9 +691,28 @@ dvb_psi_parse_pmt
         update |= PMT_UPDATE_ANCILLARY_ID;
       }
 
+      if(subtitling_type != -1 && st->es_subtitle_type != subtitling_type) {
+        st->es_subtitle_type = subtitling_type;
+        update |= PMT_UPDATE_SUBTITLE_TYPE;
+      }
+
+      if(st->es_type == SCT_TELETEXT &&
+         st->es_teletext_initial_page != tt_initial_page) {
+        st->es_teletext_initial_page = tt_initial_page;
+        update |= PMT_UPDATE_TELETEXT_PAGE;
+      }
+
       if(st->es_rds_uecp != rds_uecp) {
         st->es_rds_uecp = rds_uecp;
         update |= PMT_UPDATE_RDS_UECP;
+      }
+
+      if(component_tag >= 0 ?
+           !st->es_component_tag_set || st->es_component_tag != component_tag :
+           st->es_component_tag_set) {
+        st->es_component_tag = component_tag >= 0 ? component_tag : 0;
+        st->es_component_tag_set = component_tag >= 0;
+        update |= PMT_UPDATE_COMPONENT_TAG;
       }
 
       if (st->es_pid == set->set_pcr_pid)
@@ -605,12 +748,29 @@ dvb_psi_parse_pmt
     }
   }
 
+  /* teletext subtitles belong to the component of their teletext stream */
+  TAILQ_FOREACH(st, &set->set_all, es_link) {
+    if(st->es_type != SCT_TEXTSUB || st->es_parent_pid == 0)
+      continue;
+    TAILQ_FOREACH(next, &set->set_all, es_link)
+      if(next->es_pid == st->es_parent_pid && next->es_type == SCT_TELETEXT)
+        break;
+    if(next == NULL)
+      continue;
+    if(st->es_component_tag_set != next->es_component_tag_set ||
+       st->es_component_tag != next->es_component_tag) {
+      st->es_component_tag = next->es_component_tag;
+      st->es_component_tag_set = next->es_component_tag_set;
+      update |= PMT_UPDATE_COMPONENT_TAG;
+    }
+  }
+
   if(update & PMT_REORDERED)
     elementary_set_sort_streams(set);
 
   if (update) {
     tvhdebug(mt->mt_subsys, "%s: Service \"%s\" PMT (version %d) updated"
-     "%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s",
+     "%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s",
      mt->mt_name,
      nicename, version,
      update&PMT_UPDATE_PCR               ? ", PCR PID changed":"",
@@ -629,6 +789,9 @@ dvb_psi_parse_pmt
      update&PMT_UPDATE_CAID_DELETED      ? ", CAID deleted":"",
      update&PMT_UPDATE_CAID_PID          ? ", CAID PID changed":"",
      update&PMT_UPDATE_RDS_UECP          ? ", RDS UECP flag changed":"",
+     update&PMT_UPDATE_COMPONENT_TAG     ? ", Component tag changed":"",
+     update&PMT_UPDATE_SUBTITLE_TYPE     ? ", Subtitle type changed":"",
+     update&PMT_UPDATE_TELETEXT_PAGE     ? ", Teletext initial page changed":"",
      update&PMT_REORDERED                ? ", PIDs reordered":"");
   }
 

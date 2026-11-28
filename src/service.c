@@ -1633,6 +1633,8 @@ void service_save ( service_t *t, htsmsg_t *m )
       htsmsg_add_u32(sub, "audio_type", st->es_audio_type);
       if (st->es_audio_version)
         htsmsg_add_u32(sub, "audio_version", st->es_audio_version);
+      if (st->es_receiver_mix)
+        htsmsg_add_u32(sub, "receivermix", 1);
     }
 
     if(st->es_type == SCT_CA) {
@@ -1657,6 +1659,16 @@ void service_save ( service_t *t, htsmsg_t *m )
 
     if(st->es_type == SCT_TEXTSUB)
       htsmsg_add_u32(sub, "parentpid", st->es_parent_pid);
+
+    if(st->es_component_tag_set)
+      htsmsg_add_u32(sub, "componenttag", st->es_component_tag);
+
+    if((st->es_type == SCT_DVBSUB || st->es_type == SCT_TEXTSUB) &&
+       st->es_subtitle_type)
+      htsmsg_add_u32(sub, "subtitletype", st->es_subtitle_type);
+
+    if(st->es_type == SCT_TELETEXT && st->es_teletext_initial_page)
+      htsmsg_add_u32(sub, "initialpage", st->es_teletext_initial_page);
 
     if(SCT_ISVIDEO(st->es_type)) {
       if(st->es_width)
@@ -1827,6 +1839,9 @@ void service_load ( service_t *t, htsmsg_t *c )
           st->es_audio_version = u32;
       }
 
+      if(SCT_ISAUDIO(type) && !htsmsg_get_u32(c, "receivermix", &u32))
+        st->es_receiver_mix = u32 != 0;
+
       if(!htsmsg_get_u32(c, "position", &u32))
         st->es_position = u32;
 
@@ -1845,6 +1860,18 @@ void service_load ( service_t *t, htsmsg_t *c )
         if(!htsmsg_get_u32(c, "parentpid", &u32))
 	        st->es_parent_pid = u32;
       }
+
+      if(!htsmsg_get_u32(c, "componenttag", &u32) && u32 <= 0xff) {
+        st->es_component_tag = u32;
+        st->es_component_tag_set = 1;
+      }
+
+      if((type == SCT_DVBSUB || type == SCT_TEXTSUB) &&
+         !htsmsg_get_u32(c, "subtitletype", &u32))
+        st->es_subtitle_type = u32;
+
+      if(type == SCT_TELETEXT && !htsmsg_get_u32(c, "initialpage", &u32))
+        st->es_teletext_initial_page = u32;
 
       if(SCT_ISVIDEO(type)) {
         if(!htsmsg_get_u32(c, "width", &u32))

@@ -108,9 +108,21 @@ struct elementary_info {
   uint8_t es_ext_sri;
   uint16_t es_channels;
   uint8_t es_rds_uecp; /* RDS via UECP data present */
+  uint8_t es_receiver_mix; /* supplementary audio to be mixed with the main
+                              audio by the receiver (not for playing alone) */
 
   uint16_t es_composition_id;
   uint16_t es_ancillary_id;
+  uint8_t es_subtitle_type;  /* DVBSUB: subtitling_type of the subtitling
+                                descriptor (0x10.. normal, 0x20.. for the
+                                hard of hearing); TEXTSUB: teletext_type of
+                                the teletext descriptor (2 subtitle page,
+                                5 for the hearing impaired); 0 unknown */
+  uint16_t es_teletext_initial_page; /* TELETEXT: initial page of the
+                                        teletext descriptor (e.g. 100) */
+
+  uint8_t es_component_tag;      /* DVB stream identifier descriptor */
+  uint8_t es_component_tag_set;  /* es_component_tag is known */
 
   uint16_t es_parent_pid;    /* For subtitle streams originating from
 				a teletext stream. this is the pid

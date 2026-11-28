@@ -38,6 +38,7 @@
 #include "htsmsg_json.h"
 #include "string_list.h"
 #include "lang_codes.h"
+#include "input/mpegts/dvb.h"
 #if ENABLE_TIMESHIFT
 #include "timeshift.h"
 #endif
@@ -109,7 +110,7 @@ typedef struct htsp_msg_q {
   TAILQ_ENTRY(htsp_msg_q) hmq_link;
   int hmq_strict_prio;      /* Serve this queue 'til it's empty */
   int hmq_length;
-  int hmq_payload;          /* Bytes of streaming payload that's enqueued */
+  int64_t hmq_payload;      /* Bytes of streaming payload that's enqueued */
   int hmq_dead;
 } htsp_msg_q_t;
 
@@ -195,7 +196,12 @@ typedef struct htsp_subscription {
 
   int hs_90khz;
 
-  int hs_queue_depth;
+  int64_t hs_queue_depth;
+
+  /* data rate of the stream (bytes/s, smoothed over the last seconds) */
+  int64_t hs_rate;
+  int64_t hs_rate_at;       /* start of the current measuring second */
+  int64_t hs_rate_bytes;    /* payload since then */
 
 #define NUM_FILTERED_STREAMS (64*8)
 
@@ -4195,8 +4201,10 @@ htsp_stream_deliver(htsp_subscription_t *hs, th_pkt_t *pkt)
   htsp_msg_t *hm;
   htsp_connection_t *htsp = hs->hs_htsp;
   int64_t ts;
-  int qlen = hs->hs_q.hmq_payload;
+  int64_t qlen = hs->hs_q.hmq_payload;
   int video = SCT_ISVIDEO(pkt->pkt_type);
+  int64_t now;
+  int64_t depth;
   size_t payloadlen;
 
   if (pkt->pkt_err)
@@ -4210,10 +4218,34 @@ htsp_stream_deliver(htsp_subscription_t *hs, th_pkt_t *pkt)
     return;
   }
 
+  /* The data rate of the stream: a source that delivers in bursts (IPTV, proxies)
+   * puts up to a second of it into the queue at once, which the fixed depth
+   * (500 kB: a fifth of a second of UHD) does not hold. */
+  now = getmonoclock();
+  if (hs->hs_rate_at == 0 || now - hs->hs_rate_at >= sec2mono(3)) {
+    /* the first packet, or after a pause (a new session of the source):
+     * measure anew, the idle time would dilute the rate */
+    hs->hs_rate = 0;
+    hs->hs_rate_at = now;
+    hs->hs_rate_bytes = 0;
+  }
+  hs->hs_rate_bytes += pktbuf_len(pkt->pkt_payload);
+  if (now - hs->hs_rate_at >= sec2mono(1)) {
+    int64_t r = hs->hs_rate_bytes * MONOCLOCK_RESOLUTION / (now - hs->hs_rate_at);
+    hs->hs_rate = hs->hs_rate ? (hs->hs_rate * 3 + r) / 4 : r;
+    hs->hs_rate_at = now;
+    hs->hs_rate_bytes = 0;
+  }
+
+  /* the queue depth asked for, at least one and a half seconds of the stream */
+  depth = hs->hs_queue_depth;
+  if (hs->hs_rate * 3 / 2 > depth)
+    depth = hs->hs_rate * 3 / 2;
+
   if(video &&
-     ((qlen > hs->hs_queue_depth     && pkt->v.pkt_frametype == PKT_B_FRAME) ||
-      (qlen > hs->hs_queue_depth * 2 && pkt->v.pkt_frametype == PKT_P_FRAME) ||
-      (qlen > hs->hs_queue_depth * 3))) {
+     ((qlen > depth     && pkt->v.pkt_frametype == PKT_B_FRAME) ||
+      (qlen > depth * 2 && pkt->v.pkt_frametype == PKT_P_FRAME) ||
+      (qlen > depth * 3))) {
 
     hs->hs_dropstats[pkt->v.pkt_frametype]++;
 
@@ -4355,9 +4387,29 @@ htsp_subscription_start(htsp_subscription_t *hs, const streaming_start_t *ss)
     if(ssc->es_lang[0])
       htsmsg_add_str(c, "language", ssc->es_lang);
 
+    /* DVB stream identifier: e.g. HbbTV selects components by it */
+    if(ssc->es_component_tag_set)
+      htsmsg_add_u32(c, "component_tag", ssc->es_component_tag);
+
     if(ssc->es_type == SCT_DVBSUB) {
       htsmsg_add_u32(c, "composition_id", ssc->es_composition_id);
       htsmsg_add_u32(c, "ancillary_id", ssc->es_ancillary_id);
+      /* subtitling descriptor: 0x10.. normal, 0x20.. hard of hearing */
+      if(ssc->es_subtitle_type)
+        htsmsg_add_u32(c, "subtitling_type", ssc->es_subtitle_type);
+    }
+
+    /* the full teletext: its initial page (e.g. 100) */
+    if(ssc->es_type == SCT_TELETEXT && ssc->es_teletext_initial_page)
+      htsmsg_add_u32(c, "teletext_initial_page", ssc->es_teletext_initial_page);
+
+    /* teletext subtitles: the page (e.g. 777) and the teletext type
+     * (2 subtitle page, 5 for the hearing impaired) */
+    if(ssc->es_type == SCT_TEXTSUB) {
+      if(ssc->es_pid >= DVB_TELETEXT_BASE)
+        htsmsg_add_u32(c, "teletext_page", ssc->es_pid - DVB_TELETEXT_BASE);
+      if(ssc->es_subtitle_type)
+        htsmsg_add_u32(c, "teletext_type", ssc->es_subtitle_type);
     }
 
     if(SCT_ISVIDEO(ssc->es_type)) {
@@ -4377,6 +4429,10 @@ htsp_subscription_start(htsp_subscription_t *hs, const streaming_start_t *ss)
     if (SCT_ISAUDIO(ssc->es_type))
     {
       htsmsg_add_u32(c, "audio_type", ssc->es_audio_type);
+      /* supplementary audio to be mixed with the main audio (e.g. a
+       * receiver-mix audio description), not for playing alone */
+      if (ssc->es_receiver_mix)
+        htsmsg_add_u32(c, "receiver_mix", 1);
       if (ssc->es_audio_version)
         htsmsg_add_u32(c, "audio_version", ssc->es_audio_version);
       if (ssc->es_channels)

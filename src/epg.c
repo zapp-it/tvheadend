@@ -495,6 +495,15 @@ static void _epg_channel_rem_broadcast
   ( channel_t *ch, epg_broadcast_t *ebc, epg_broadcast_t *ebc_new )
 {
   RB_REMOVE(&ch->ch_epg_schedule, ebc, sched_link);
+  /*
+   * The broadcast can outlive its place in the schedule (for example a
+   * recording that is already running keeps its reference, see
+   * dvr_event_replaced()), and it can still be looked up by id. Clear the
+   * stale links so that epg_broadcast_get_next()/get_prev() return NULL
+   * for it instead of following pointers to neighbours that may already
+   * have been freed.
+   */
+  memset(&ebc->sched_link, 0, sizeof(ebc->sched_link));
   if (ch->ch_epg_now  == ebc) ch->ch_epg_now  = NULL;
   if (ch->ch_epg_next == ebc) ch->ch_epg_next = NULL;
   if (ebc_new) {
@@ -504,6 +513,11 @@ static void _epg_channel_rem_broadcast
   }
   _epg_object_putref(ebc);
 }
+
+/* How long a running flag is honoured past the last report from the
+ * stream. The present/following table repeats every few seconds while
+ * the mux is tuned, so a silence this long means it is not. */
+#define EPG_RUNNING_STALE (5*60)
 
 static void _epg_channel_timer_callback ( void *p )
 {
@@ -515,9 +529,19 @@ static void _epg_channel_timer_callback ( void *p )
   /* Clear now/next */
   if ((cur = ch->ch_epg_now)) {
     if (cur->running != EPG_RUNNING_STOP && cur->running != EPG_RUNNING_NOTSET) {
-      /* running? don't do anything */
-      gtimer_arm_rel(&ch->ch_epg_timer, _epg_channel_timer_callback, ch, 2);
-      return;
+      if (cur->running_updated + EPG_RUNNING_STALE > gclk()) {
+        /* running? don't do anything */
+        gtimer_arm_rel(&ch->ch_epg_timer, _epg_channel_timer_callback, ch, 2);
+        return;
+      }
+      /* The flag is only ever changed by the stream, and the stream has
+       * not reported it for a while, so nothing can clear it: the mux is
+       * no longer tuned. Treat the broadcast as stopped. */
+      tvhdebug(LS_EPG, "stale running state on event %u (%s) from %s",
+               cur->id, epg_broadcast_get_title(cur, NULL),
+               channel_get_name(ch, channel_blank_name));
+      cur->running = EPG_RUNNING_STOP;
+      dvr_event_running(cur, EPG_RUNNING_STOP);
     }
     cur->ops->getref(cur);
   }
@@ -784,13 +808,32 @@ static int epg_match_event_fuzzy(epg_broadcast_t *a, epg_broadcast_t *b)
 
 epg_broadcast_t *epg_match_now_next ( channel_t *ch, epg_broadcast_t *ebc )
 {
-  epg_broadcast_t *ret;
+  epg_broadcast_t *cand[4], *ret = NULL, *e;
+  int64_t diff, best = 0;
+  int i;
 
-  if (epg_match_event_fuzzy(ch->ch_epg_now, ebc))
-    ret = ch->ch_epg_now;
-  else if (epg_match_event_fuzzy(ch->ch_epg_next, ebc))
-    ret = ch->ch_epg_next;
-  else
+  /* The now/next pointers stop following the clock while the current
+   * broadcast is flagged running, so also consider the broadcast that
+   * is on air by the clock and the one after it */
+  RB_FOREACH(e, &ch->ch_epg_schedule, sched_link)
+    if (e->stop > gclk()) break;
+  cand[0] = ch->ch_epg_now;
+  cand[1] = ch->ch_epg_next;
+  cand[2] = e;
+  cand[3] = e ? RB_NEXT(e, sched_link) : NULL;
+
+  /* Prefer the candidate whose start time is closest */
+  for (i = 0; i < 4; i++) {
+    e = cand[i];
+    if (e == NULL || !epg_match_event_fuzzy(e, ebc))
+      continue;
+    diff = llabs((int64_t)e->start - (int64_t)ebc->start);
+    if (ret == NULL || diff < best) {
+      ret = e;
+      best = diff;
+    }
+  }
+  if (ret == NULL)
     return NULL;
   /* update eid for further lookups */
   if (ret->dvb_eid != ebc->dvb_eid && ret->dvb_eid == 0 && ebc->dvb_eid)
@@ -1174,6 +1217,7 @@ int epg_broadcast_set_running
   ( epg_broadcast_t *broadcast, epg_running_t running )
 {
   int save = 0;
+  broadcast->running_updated = gclk();
   if (running != broadcast->running) {
     broadcast->update_running = running;
     _epg_object_set_updated(broadcast);
